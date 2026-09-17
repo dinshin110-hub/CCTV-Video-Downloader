@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    name: Build release
+    uses: ./.github/workflows/build.yml
+
+  sign:
+    name: Sign with SignPath
+    needs: build
+    if: ${{ vars.SIGNPATH_ENABLED == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download unsigned executable
+        uses: actions/download-artifact@v4
+        with:
+          name: CCTVVideoDownloader-unsigned
+          path: unsigned
+
+      - name: Upload signing input
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCTVVideoDownloader-signing-input
+          path: unsigned/CCTVVideoDownloader.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Submit SignPath signing request
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify signed output exists
+        shell: pwsh
+        run: |
+          Get-ChildItem -LiteralPath signed -Recurse -File | Format-Table FullName, Length
+          if (-not (Get-ChildItem -LiteralPath signed -Recurse -File -Filter CCTVVideoDownloader.exe)) {
+            throw "SignPath did not return CCTVVideoDownloader.exe"
+          }
+
+      - name: Upload signed executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCTVVideoDownloader-signed
+          path: signed/**/CCTVVideoDownloader.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  release-signed:
+    name: Publish signed release
+    needs: sign
+    if: ${{ vars.SIGNPATH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download signed executable
+        uses: actions/download-artifact@v4
+        with:
+          name: CCTVVideoDownloader-signed
+          path: release-assets
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd release-assets
+          find . -type f -name "CCTVVideoDownloader.exe" -print0 | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          fi
+          find release-assets -type f -name "CCTVVideoDownloader.exe" -exec gh release upload "$GITHUB_REF_NAME" {} --clobber \;
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS.txt --clobber
+
+  release-unsigned:
+    name: Publish unsigned release
+    needs: build
+    if: ${{ vars.SIGNPATH_ENABLED != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download unsigned executable
+        uses: actions/download-artifact@v4
+        with:
+          name: CCTVVideoDownloader-unsigned
+          path: release-assets
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          fi
+          find release-assets -type f -name "CCTVVideoDownloader.exe" -exec gh release upload "$GITHUB_REF_NAME" {} --clobber \;
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS.txt --clobber
